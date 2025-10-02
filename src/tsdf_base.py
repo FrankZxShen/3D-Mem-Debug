@@ -203,7 +203,7 @@ class TSDFPlannerBase:
           margin_w (int): The margin from the sides of the image to exclude when integrating explored
         """
         im_h, im_w = depth_im.shape
-        max_dist = 3.0
+        max_dist = 5.0
 
         # Convert voxel grid coordinates to pixel coordinates
         cam_pts = rigid_transform(self.cam_pts_pre, np.linalg.inv(cam_pose))
