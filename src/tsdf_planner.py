@@ -40,6 +40,7 @@ class Frontier:
     feature: torch.Tensor = (
         None  # the image feature of the snapshot, not used when generating data
     )
+    labels: List[str] = field(default_factory=list)
 
     def __eq__(self, other):
         if not isinstance(other, Frontier):
