@@ -15,6 +15,8 @@ import torch
 import time
 import json
 import logging
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 import open_clip
@@ -97,6 +99,7 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0):
 
         # load scene
         try:
+            scene.close()
             del scene
         except:
             pass
