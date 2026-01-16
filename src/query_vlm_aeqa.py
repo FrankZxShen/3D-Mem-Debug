@@ -33,6 +33,24 @@ def query_vlm_for_response(
     step_dict["frontier_imgs"] = [
         frontier.feature for frontier in tsdf_planner.frontiers
     ]
+    step_dict["frontier_classes"] = []
+    for frontier in tsdf_planner.frontiers:
+        if not frontier.labels:
+            try:
+                if scene.detection_model:
+                    results = scene.detection_model.predict(
+                        frontier.feature, conf=0.1, verbose=False
+                    )
+                    det_labels = []
+                    for r in results:
+                        if r.boxes:
+                            for cls_id in r.boxes.cls:
+                                det_labels.append(r.names[int(cls_id)])
+                    det_labels = sorted(list(set(det_labels)))
+                    frontier.labels = det_labels
+            except Exception as e:
+                logging.error(f"Error detecting objects in frontier: {e}")
+        step_dict["frontier_classes"].append(frontier.labels)
 
     # prepare egocentric views
     if cfg.egocentric_views:
