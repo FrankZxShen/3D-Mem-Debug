@@ -7,12 +7,19 @@ import os
 import time
 from typing import Optional
 import logging
+import chromadb
 from src.const import *
 
 
+# client = OpenAI(
+#     base_url=END_POINT,
+#     api_key=OPENAI_KEY,
+# )
+
+# For local VLM
 client = OpenAI(
-    base_url=END_POINT,
-    api_key=OPENAI_KEY,
+    api_key=openai_api_key,
+    base_url=openai_api_base,
 )
 
 
@@ -32,9 +39,43 @@ def format_content(contents):
             )
     return formated_content
 
-
 # send information to openai
 def call_openai_api(sys_prompt, contents) -> Optional[str]:
+    max_tries = 5
+    retry_count = 0
+    formated_content = format_content(contents)
+    message_text = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": formated_content},
+    ]
+    while retry_count < max_tries:
+        try:
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,  # model = "deployment_name"
+                messages=message_text,
+                temperature=1.0,
+                max_tokens=256,
+                top_p=0.95,
+                frequency_penalty=0,
+                presence_penalty=0,
+                stop=None,
+            )
+            return completion.choices[0].message.content
+        except openai.RateLimitError as e:
+            print("Rate limit error, waiting for 3s")
+            time.sleep(3)
+            retry_count += 1
+            continue
+        except Exception as e:
+            print("Error: ", e)
+            time.sleep(3)
+            retry_count += 1
+            continue
+
+    return None
+
+# send information to openai
+def call_openai_api_gpt4o(sys_prompt, contents) -> Optional[str]:
     max_tries = 5
     retry_count = 0
     formated_content = format_content(contents)
@@ -77,6 +118,181 @@ def encode_tensor2base64(img):
     buffer.seek(0)
     img_base64 = base64.b64encode(buffer.read()).decode("utf-8")
     return img_base64
+
+
+def resize_base64_image(base64_str, target_size=(256, 256)):
+    if not base64_str:
+        return base64_str
+    try:
+        image_data = base64.b64decode(base64_str)
+        image = Image.open(BytesIO(image_data))
+        resized_image = image.resize(target_size)
+        buffer = BytesIO()
+        resized_image.save(buffer, format="PNG")
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    except Exception as e:
+        print(f"Error resizing image: {e}")
+        return base64_str
+
+
+def retrieve_experience_from_chroma(question):
+    try:
+        db_file = "/home/szx/project/3D-Mem-Debug/results/CG-chroma_db-ALL/chroma_db-CG-DATA-5qwen3plus/chroma.sqlite3"
+        db_dir = os.path.dirname(db_file)
+        client = chromadb.PersistentClient(path=db_dir)
+        try:
+            collection = client.get_collection(name="nav_experiences")
+        except Exception:
+            cols = client.list_collections()
+            if not cols:
+                return None
+            name = cols[0].name if hasattr(cols[0], "name") else cols[0]
+            collection = client.get_collection(name=name)
+        res = collection.query(
+            query_texts=[f"IF answering {question}"],
+            where={"type": "object_goal"},
+            n_results=1,
+            include=["documents"],
+        )
+        docs = res.get("documents")
+        if docs and len(docs) > 0 and len(docs[0]) > 0:
+            return docs[0][0]
+    except Exception:
+        return None
+    return None
+
+
+def format_explore_prompt_evolver(
+    question,
+    egocentric_imgs,
+    frontier_imgs,
+    snapshot_imgs,
+    snapshot_classes,
+    snapshot_crops=None,
+    frontier_classes=None,
+    egocentric_view=False,
+    use_snapshot_class=True,
+    image_goal=None,
+    experience=None,
+    use_experience=True,
+):
+    target_size = (256, 256)
+    if egocentric_imgs:
+        egocentric_imgs = [resize_base64_image(img, target_size) for img in egocentric_imgs]
+    if frontier_imgs:
+        frontier_imgs = [resize_base64_image(img, target_size) for img in frontier_imgs]
+    if snapshot_imgs:
+        if isinstance(snapshot_imgs, dict):
+            snapshot_imgs = {
+                rgb_id: resize_base64_image(img, target_size)
+                for rgb_id, img in snapshot_imgs.items()
+            }
+        else:
+            snapshot_imgs = [resize_base64_image(img, target_size) for img in snapshot_imgs]
+    if snapshot_crops:
+        snapshot_crops = {
+            rgb_id: [resize_base64_image(img, target_size) for img in crops]
+            for rgb_id, crops in snapshot_crops.items()
+        }
+    if image_goal is not None:
+        image_goal = resize_base64_image(image_goal, target_size)
+
+    if use_experience and experience is None:
+        experience = retrieve_experience_from_chroma(question)
+
+    exp_section = ""
+    if experience:
+        exp_section = (
+            "<EXP>\n"
+            "Guidance from Memory:\n"
+            f"{experience}\n"
+            "(Instruction: Carefully check if any candidate image contains the visual cues mentioned in the 'IF' condition of this experience. If a match is found, strictly prioritize that path as per the 'THEN' rule.)\n"
+            "</EXP>\n\n"
+        )
+
+    sys_prompt = (
+        "Task: You are an intelligent robot navigating in an indoor scene. Your task is to select a Frontier Image for further exploration or a Memory Image + Object for answering the given Question.\n\n"
+    )
+
+    content = []
+    text = f"Question:\n{question}"
+    if image_goal is not None:
+        content.append((text, image_goal))
+        content.append(("\n\n",))
+    else:
+        content.append((text + "\n\n",))
+
+    if exp_section:
+        content.append((exp_section,))
+
+    text = (
+        "Definitions:\n"
+        "1. Frontier Image: An observation of unexplored areas that may provide new clues for answering the Question. Selecting a Frontier Image means that you will further explore that direction. If you choose a Frontier Image, you need to explain why you would like to choose that direction to explore.\n"
+        "2. Memory Image: A focused observation of several objects. Selecting a Memory Image means that you have found the relevant area and should choose ONE object within that memory image as the navigation target to answer the Question.\n"
+        "Candidate Images:\n"
+    )
+    content.append((text,))
+
+    # if egocentric_view and egocentric_imgs:
+    #     content.append(("\n[Egocentric View]\n",))
+    #     content.append(("Current egocentric view: ", egocentric_imgs[-1]))
+    #     content.append(("\n",))
+
+    content.append(("\n[Frontier Images]\n",))
+    if frontier_imgs:
+        for i, img in enumerate(frontier_imgs):
+            content.append((f"Frontier Image {i}: ", img))
+            if frontier_classes and i < len(frontier_classes) and frontier_classes[i]:
+                labels_text = ", ".join(frontier_classes[i])
+                content.append((f"\n[Detected Objects]: {labels_text}\n",))
+            else:
+                content.append(("\n",))
+    else:
+        content.append(("\nNo Frontier Images available.\n",))
+
+    content.append(("\n[Memory Images]\n",))
+    if snapshot_imgs and isinstance(snapshot_imgs, dict):
+        for i, rgb_id in enumerate(snapshot_imgs.keys()):
+            content.append((f"Memory Image {i}: ", snapshot_imgs[rgb_id]))
+            if snapshot_crops and rgb_id in snapshot_crops:
+                for j in range(len(snapshot_crops[rgb_id])):
+                    if use_snapshot_class and rgb_id in snapshot_classes and j < len(
+                        snapshot_classes[rgb_id]
+                    ):
+                        obj_text = f"Object {j}: {snapshot_classes[rgb_id][j]}"
+                    else:
+                        obj_text = f"Object {j}:"
+                    content.append((obj_text, snapshot_crops[rgb_id][j]))
+                content.append(("\n",))
+            else:
+                if use_snapshot_class and rgb_id in snapshot_classes:
+                    labels_text = ", ".join(snapshot_classes[rgb_id])
+                    content.append((f"\n[Detected Objects]: {labels_text}\n",))
+                else:
+                    content.append(("\n",))
+    else:
+        content.append(("\nNo Memory Images available.\n",))
+
+    prompt_instruction = (
+        "\nInstruction for Reasoning or Answer:\n"
+        f"1. Find visual evidence for \"{question}\" considering <EXP>.\n"
+        "2. Response constraints:\n"
+        "   - The Reason or Answer must be a simple, direct, natural sentence understandable by others. NO meta-words (e.g., 'this image').\n"
+        "   - You should always choose the ONE most relevant Memory/Frontier index (and ONE object index if choosing a Memory Image).\n"
+        "3. Provide your response in the following strict format:\n"
+        "   - If you choose a Frontier Image (for reasoning/exploration), return:\n"
+        "     \"Frontier Image i\\nReason: [Reason]\"\n"
+        "   - If you choose a Memory Image (for answering), return:\n"
+        "     \"Memory Image i, Object j\\nAnswer: [Answer]\"\n"
+        "   (Where i is the chosen image index and j is the object index within the chosen Memory Image)\n"
+        "4. Examples:\n"
+        "Frontier Image 0\nReason: The hallway likely leads to the living room.\n"
+        "Memory Image 1, Object 2\nAnswer: The mug is on the kitchen counter.\n"
+        "Now return your response\n"
+    )
+    content.append((prompt_instruction,))
+
+    return sys_prompt, content
 
 
 def format_question(step):
@@ -367,17 +583,31 @@ def explore_step(step, cfg, verbose=False):
         snapshot_id_mapping,
         snapshot_crop_mapping,
     ) = get_step_info(step, verbose)
-    sys_prompt, content = format_explore_prompt(
+    sys_prompt, content = format_explore_prompt_evolver(
         question,
         egocentric_imgs,
         frontier_imgs,
         snapshot_full_imgs,
         snapshot_classes,
         snapshot_crops,
+        frontier_classes=None,
         egocentric_view=step.get("use_egocentric_views", False),
         use_snapshot_class=True,
         image_goal=image_goal,
+        use_experience=getattr(cfg, "use_experience", True),
     )
+
+    # sys_prompt, content = format_explore_prompt(
+    #     question,
+    #     egocentric_imgs,
+    #     frontier_imgs,
+    #     snapshot_full_imgs,
+    #     snapshot_classes,
+    #     snapshot_crops,
+    #     egocentric_view=step.get("use_egocentric_views", False),
+    #     use_snapshot_class=True,
+    #     image_goal=image_goal,
+    # )
 
     if verbose:
         logging.info(f"Input prompt:")
@@ -392,18 +622,55 @@ def explore_step(step, cfg, verbose=False):
     final_response = None
     final_reason = None
     for _ in range(retry_bound):
-        response = call_openai_api(sys_prompt, content)
+        full_response = call_openai_api(sys_prompt, content)
 
-        if response is None:
+        if full_response is None:
             print("call_openai_api returns None, retrying")
             continue
 
-        response = response.strip()
-        if "\n" in response:
-            response = response.split("\n")
-            response, reason = response[0], response[-1]
+        full_response = full_response.strip()
+        is_evolver_format = False
+        import re
+
+        snapshot_match = re.search(
+            r"(?:Snapshot|Memory Image)\s+(\d+)", full_response, re.IGNORECASE
+        )
+        object_match = re.search(r"Object\s+(\d+)", full_response, re.IGNORECASE)
+        frontier_match = re.search(
+            r"Frontier(?:\s+Image)?\s+(\d+)", full_response, re.IGNORECASE
+        )
+
+        if snapshot_match and object_match:
+            is_evolver_format = True
+            image_idx = int(snapshot_match.group(1))
+            obj_idx = int(object_match.group(1))
+            response = f"snapshot {image_idx}, object {obj_idx}"
+            answer_match = re.search(
+                r"Answer:\s*(.*)", full_response, re.IGNORECASE | re.DOTALL
+            )
+            if answer_match:
+                reason = answer_match.group(1).strip()
+            else:
+                reason_match = re.search(
+                    r"Reason:\s*(.*)", full_response, re.IGNORECASE | re.DOTALL
+                )
+                reason = reason_match.group(1).strip() if reason_match else ""
+        elif frontier_match:
+            is_evolver_format = True
+            image_idx = int(frontier_match.group(1))
+            response = f"frontier {image_idx}"
+            reason_match = re.search(
+                r"Reason:\s*(.*)", full_response, re.IGNORECASE | re.DOTALL
+            )
+            reason = reason_match.group(1).strip() if reason_match else ""
         else:
-            reason = ""
+            response = full_response
+            if "\n" in response:
+                response = response.split("\n")
+                response, reason = response[0], response[-1]
+            else:
+                reason = ""
+
         response = response.lower()
         try:
             choice_type, choice_id = response.split(",")[0].strip().split(" ")
