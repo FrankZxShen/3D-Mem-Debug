@@ -179,11 +179,14 @@ class Scene:
         self.clip_preprocess = clip_preprocess
         self.clip_tokenizer = clip_tokenizer
 
-    def __del__(self):
+    def close(self):
         try:
             self.simulator.close()
         except:
             pass
+
+    def __del__(self):
+        self.close()
 
     def clear_up_detections(self):
         self.objects = MapObjectDict()
