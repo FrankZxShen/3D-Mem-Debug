@@ -45,7 +45,7 @@ Response: {prediction}
 
 
 def create_qwen_client():
-    api_key = "sk-44e9a14de5534e71963237a21e277b30"
+    api_key = "xxx"
     if not api_key:
         raise RuntimeError("QWEN_API_KEY is not set in environment variables")
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
